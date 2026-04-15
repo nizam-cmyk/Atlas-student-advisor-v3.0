@@ -141,6 +141,28 @@
       color:#6a7f8d;
     }
 
+    .message-text{
+      white-space:pre-wrap;
+    }
+
+    .file-chip{
+      display:inline-flex;
+      align-items:center;
+      gap:8px;
+      margin-top:10px;
+      padding:8px 12px;
+      border-radius:999px;
+      background:rgba(255,255,255,.8);
+      border:1px solid #d7dfff;
+      color:#526979;
+      font-size:13px;
+      font-weight:600;
+      max-width:100%;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+    }
+
     .composer{
       display:flex;
       flex-direction:column;
@@ -300,7 +322,10 @@
       </div>
 
       <div id="messages" class="chat">
-        <div class="msg bot"><span class="label">ATLAS</span>How can I help you today?</div>
+        <div class="msg bot">
+          <span class="label">ATLAS</span>
+          <div class="message-text">How can I help you today?</div>
+        </div>
       </div>
 
       <div class="composer">
@@ -326,82 +351,409 @@
     </section>
   </main>
 
-<script>
-  async function sendMessage() {
-    if (isSending) return;
+  <script>
+    const messages = document.getElementById('messages');
+    const message = document.getElementById('message');
+    const file = document.getElementById('file');
+    const send = document.getElementById('send');
+    const micBtn = document.getElementById('micBtn');
+    const voiceToggle = document.getElementById('voiceToggle');
+    const replyVoiceToggle = document.getElementById('replyVoiceToggle');
+    const voiceStatus = document.getElementById('voiceStatus');
+    const installBtn = document.getElementById('installBtn');
 
-    const text = message.value.trim();
-    const f = file.files[0];
-    if (!text && !f) return;
+    const STORAGE_KEY = 'atlas_session_context_v1';
+    const VOICE_ENABLED_KEY = 'atlas_voice_enabled_v1';
+    const REPLY_VOICE_ENABLED_KEY = 'atlas_reply_voice_enabled_v1';
 
-    isSending = true;
-    send.disabled = true;
+    let deferredPrompt = null;
+    let isSending = false;
 
-    let shown = '';
-    if (text && f) {
-      shown = `${text}\n\nUploaded file: ${f.name}`;
-    } else if (f) {
-      shown = `Uploaded file: ${f.name}`;
-    } else {
-      shown = text;
+    const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+    const SpeechRecognition =
+      !isIOS && (window.SpeechRecognition || window.webkitSpeechRecognition || null);
+
+    let recognition = null;
+    let isListening = false;
+
+    function escapeHtml(value) {
+      return String(value || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
     }
 
-    add('you', 'You', shown);
+    function addMessage({ cls, who, text = '', fileName = '' }) {
+      const div = document.createElement('div');
+      div.className = 'msg ' + cls;
 
-    let extractedFileText = '';
-    let fileUpload = null;
+      let inner = `<span class="label">${escapeHtml(who)}</span>`;
 
-    try {
-      extractedFileText = await readTextLikeFile(f);
-    } catch {}
+      if (text) {
+        inner += `<div class="message-text">${escapeHtml(text)}</div>`;
+      }
 
-    if (f) {
+      if (fileName) {
+        inner += `<div class="file-chip">📎 ${escapeHtml(fileName)}</div>`;
+      }
+
+      div.innerHTML = inner;
+      messages.appendChild(div);
+      messages.scrollTop = messages.scrollHeight;
+      return div;
+    }
+
+    function add(cls, who, text) {
+      return addMessage({ cls, who, text });
+    }
+
+    function getSessionContext() {
       try {
-        fileUpload = {
-          filename: f.name,
-          type: f.type || null,
-          size: f.size || null,
-          base64: await fileToBase64(f)
-        };
+        const raw = localStorage.getItem(STORAGE_KEY);
+        return raw ? JSON.parse(raw) : null;
+      } catch {
+        return null;
+      }
+    }
+
+    function setSessionContext(context) {
+      try {
+        if (context) localStorage.setItem(STORAGE_KEY, JSON.stringify(context));
       } catch {}
     }
 
-    const payload = {
-      message: text,
-      fileMeta: f ? { filename: f.name, type: f.type || null, size: f.size || null } : null,
-      fileUpload,
-      documentText: extractedFileText,
-      sessionContext: getSessionContext()
-    };
+    function getVoiceEnabled() {
+      try {
+        const raw = localStorage.getItem(VOICE_ENABLED_KEY);
+        return raw === null ? true : raw === 'true';
+      } catch {
+        return true;
+      }
+    }
 
-    message.value = '';
-    file.value = '';
-    autoResizeTextarea();
+    function setVoiceEnabled(value) {
+      try {
+        localStorage.setItem(VOICE_ENABLED_KEY, String(Boolean(value)));
+      } catch {}
+    }
 
-    const botNode = add('bot', 'ATLAS', 'Thinking...');
+    function getReplyVoiceEnabled() {
+      try {
+        return localStorage.getItem(REPLY_VOICE_ENABLED_KEY) === 'true';
+      } catch {
+        return false;
+      }
+    }
 
-    try {
-      const res = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+    function setReplyVoiceEnabled(value) {
+      try {
+        localStorage.setItem(REPLY_VOICE_ENABLED_KEY, String(Boolean(value)));
+      } catch {}
+    }
+
+    function updateVoiceToggle() {
+      const enabled = getVoiceEnabled();
+      voiceToggle.textContent = enabled ? '🔊 Voice greeting on' : '🔇 Voice greeting off';
+      voiceToggle.setAttribute('aria-pressed', String(enabled));
+    }
+
+    function updateReplyVoiceToggle() {
+      const enabled = getReplyVoiceEnabled();
+      replyVoiceToggle.textContent = enabled ? '🗣️ Reply voice on' : '🗣️ Reply voice off';
+      replyVoiceToggle.setAttribute('aria-pressed', String(enabled));
+    }
+
+    function getPreferredVoice() {
+      if (!('speechSynthesis' in window)) return null;
+      const voices = window.speechSynthesis.getVoices();
+      return (
+        voices.find(v => v.lang === 'en-GB') ||
+        voices.find(v => v.lang === 'en-US') ||
+        voices[0] ||
+        null
+      );
+    }
+
+    function speakNow(text) {
+      if (!('speechSynthesis' in window)) return;
+      const spoken = String(text || '').trim();
+      if (!spoken) return;
+
+      const utterance = new SpeechSynthesisUtterance(spoken);
+      const voice = getPreferredVoice();
+      if (voice) utterance.voice = voice;
+      utterance.rate = 1;
+      utterance.pitch = 1;
+      utterance.volume = 1;
+
+      window.speechSynthesis.cancel();
+      window.speechSynthesis.speak(utterance);
+    }
+
+    function speakGreeting() {
+      if (!getVoiceEnabled()) return;
+      speakNow('Hello. I am ATLAS. How can I help you today?');
+    }
+
+    function cleanReplyForSpeech(text) {
+      return String(text || '')
+        .replace(/ATLAS\s*·\s*/gi, '')
+        .replace(/[_*#`>-]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    }
+
+    function speakReply(text) {
+      if (!getReplyVoiceEnabled()) return;
+      speakNow(cleanReplyForSpeech(text));
+    }
+
+    function getDefaultStatus() {
+      if (isIOS) {
+        return 'Voice input is unavailable on iPhone. You can still type your question.';
+      }
+      if (!SpeechRecognition) {
+        return 'Voice input is not supported in this browser. You can still type your question.';
+      }
+      return 'Ask about your studies or get guidance on the courses to take this semester.';
+    }
+
+    function setMicState(listening) {
+      isListening = listening;
+      micBtn.classList.toggle('listening', listening);
+      micBtn.textContent = listening ? '🎙️' : '🎤';
+      voiceStatus.textContent = listening
+        ? 'Listening... Speak your question clearly.'
+        : getDefaultStatus();
+    }
+
+    function initSpeechRecognition() {
+      if (!SpeechRecognition) return null;
+
+      const recog = new SpeechRecognition();
+      recog.lang = 'en-US';
+      recog.interimResults = true;
+      recog.maxAlternatives = 1;
+      recog.continuous = false;
+
+      recog.onstart = () => setMicState(true);
+
+      recog.onresult = (event) => {
+        let finalTranscript = '';
+        let interim = '';
+
+        for (let i = 0; i < event.results.length; i++) {
+          const transcript = event.results[i][0].transcript;
+          if (event.results[i].isFinal) {
+            finalTranscript += transcript + ' ';
+          } else {
+            interim += transcript;
+          }
+        }
+
+        message.value = (finalTranscript + interim).trim();
+        autoResizeTextarea();
+      };
+
+      recog.onerror = (event) => {
+        setMicState(false);
+        const err = event?.error || 'unknown';
+        voiceStatus.textContent = `Voice input error: ${err}.`;
+      };
+
+      recog.onend = () => setMicState(false);
+
+      return recog;
+    }
+
+    function autoResizeTextarea() {
+      message.style.height = '64px';
+      message.style.height = Math.min(message.scrollHeight, 180) + 'px';
+    }
+
+    async function fileToBase64(selectedFile) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const result = String(reader.result || '');
+          const commaIndex = result.indexOf(',');
+          resolve(commaIndex >= 0 ? result.slice(commaIndex + 1) : result);
+        };
+        reader.onerror = reject;
+        reader.readAsDataURL(selectedFile);
+      });
+    }
+
+    async function readTextLikeFile(selectedFile) {
+      if (!selectedFile) return '';
+      const textLike = ['text/plain', 'application/json', 'text/csv', 'text/markdown'];
+      const name = (selectedFile.name || '').toLowerCase();
+      const textLikeExt = ['.txt', '.json', '.csv', '.md'];
+      const canRead = textLike.includes(selectedFile.type) || textLikeExt.some(ext => name.endsWith(ext));
+      if (!canRead) return '';
+      return await selectedFile.text();
+    }
+
+    async function sendMessage() {
+      if (isSending) return;
+
+      const text = message.value.trim();
+      const f = file.files[0];
+      if (!text && !f) return;
+
+      isSending = true;
+      send.disabled = true;
+
+      addMessage({
+        cls: 'you',
+        who: 'You',
+        text,
+        fileName: f ? f.name : ''
       });
 
-      const data = await res.json();
-      if (data && data.sessionContext) setSessionContext(data.sessionContext);
+      let extractedFileText = '';
+      let fileUpload = null;
 
-      const atlasReply = data?.reply || 'No response received.';
-      botNode.innerHTML = `<span class="label">ATLAS</span>${escapeHtml(atlasReply)}`;
-      speakReply(atlasReply);
-    } catch (err) {
-      const failReply = 'ATLAS could not reach the server. Please try again.';
-      botNode.innerHTML = `<span class="label">ATLAS</span>${escapeHtml(failReply)}`;
-      speakReply(failReply);
-    } finally {
-      isSending = false;
-      send.disabled = false;
+      try {
+        extractedFileText = await readTextLikeFile(f);
+      } catch {}
+
+      if (f) {
+        try {
+          fileUpload = {
+            filename: f.name,
+            type: f.type || null,
+            size: f.size || null,
+            base64: await fileToBase64(f)
+          };
+        } catch {}
+      }
+
+      const payload = {
+        message: text,
+        fileMeta: f ? { filename: f.name, type: f.type || null, size: f.size || null } : null,
+        fileUpload,
+        documentText: extractedFileText,
+        sessionContext: getSessionContext()
+      };
+
+      message.value = '';
+      file.value = '';
+      autoResizeTextarea();
+
+      const botNode = add('bot', 'ATLAS', 'Thinking...');
+
+      try {
+        const res = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        const data = await res.json();
+        if (data && data.sessionContext) setSessionContext(data.sessionContext);
+
+        const atlasReply = data?.reply || 'No response received.';
+        botNode.innerHTML = `<span class="label">ATLAS</span><div class="message-text">${escapeHtml(atlasReply)}</div>`;
+        speakReply(atlasReply);
+      } catch (err) {
+        const failReply = 'ATLAS could not reach the server. Please try again.';
+        botNode.innerHTML = `<span class="label">ATLAS</span><div class="message-text">${escapeHtml(failReply)}</div>`;
+        speakReply(failReply);
+      } finally {
+        isSending = false;
+        send.disabled = false;
+      }
     }
-  }
-</script>
+
+    voiceToggle.addEventListener('click', () => {
+      const next = !getVoiceEnabled();
+      setVoiceEnabled(next);
+      updateVoiceToggle();
+      if (next) speakGreeting();
+    });
+
+    replyVoiceToggle.addEventListener('click', () => {
+      const next = !getReplyVoiceEnabled();
+      setReplyVoiceEnabled(next);
+      updateReplyVoiceToggle();
+    });
+
+    if (SpeechRecognition) {
+      recognition = initSpeechRecognition();
+
+      micBtn.addEventListener('click', () => {
+        if (!recognition) return;
+        if (isListening) {
+          recognition.stop();
+          return;
+        }
+        try {
+          recognition.start();
+        } catch {
+          voiceStatus.textContent = 'Voice input could not start. Try Chrome on Android.';
+        }
+      });
+    } else {
+      micBtn.disabled = true;
+      micBtn.hidden = isIOS;
+    }
+
+    send.addEventListener('click', sendMessage);
+
+    message.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+      }
+    });
+
+    message.addEventListener('input', autoResizeTextarea);
+
+    window.addEventListener('beforeinstallprompt', (e) => {
+      e.preventDefault();
+      deferredPrompt = e;
+      installBtn.hidden = false;
+    });
+
+    installBtn.addEventListener('click', async () => {
+      if (!deferredPrompt) return;
+      deferredPrompt.prompt();
+      await deferredPrompt.userChoice;
+      deferredPrompt = null;
+      installBtn.hidden = true;
+    });
+
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.getVoices();
+      window.speechSynthesis.onvoiceschanged = () => {
+        window.speechSynthesis.getVoices();
+      };
+    }
+
+    let greetedThisVisit = false;
+    function firstInteractionGreeting() {
+      if (greetedThisVisit) return;
+      greetedThisVisit = true;
+      speakGreeting();
+    }
+
+    window.addEventListener('click', firstInteractionGreeting, { once: true });
+    window.addEventListener('touchstart', firstInteractionGreeting, { once: true });
+    window.addEventListener('keydown', firstInteractionGreeting, { once: true });
+
+    window.addEventListener('load', () => {
+      updateVoiceToggle();
+      updateReplyVoiceToggle();
+      autoResizeTextarea();
+      voiceStatus.textContent = getDefaultStatus();
+    });
+
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js'));
+    }
+  </script>
 </body>
 </html>
